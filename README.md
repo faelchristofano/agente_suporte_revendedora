@@ -273,9 +273,13 @@ O MVP prova o fluxo ponta a ponta em **um único processo**, com estado, índice
 - **Segurança por desenho:** autenticação e autorização por revendedora (o CPF e o escopo vêm do token, não do texto digitado), contratos de entrada e saída validados por schema, auditoria de cada chamada e um ponto único para aplicar *rate limits* e mascarar dados.
 
 ### Escalabilidade do RAG
-- **Do ChromaDB local para um banco vetorial gerenciado:** **Pinecone, Milvus ou pgvector**, capazes de paralelizar milhares de buscas semânticas por segundo, com réplicas de leitura.
-- **Indexação desacoplada:** o catálogo de cada ciclo é indexado por um *pipeline* offline (ingestão, *chunking*, embeddings e versionamento por ciclo), em vez de ser construído no startup da API. Assim a API só consulta o índice, e a troca de ciclo não exige deploy.
-- **Qualidade:** filtros por metadados (ciclo, marca, categoria) e *reranking* para melhorar a precisão com catálogos maiores.
+- **Do ChromaDB local para um banco vetorial gerenciado:** migração do ChromaDB *in-memory* para **Pinecone, Milvus ou pgvector**, capazes de paralelizar milhares de buscas semânticas por segundo com réplicas de leitura e alta disponibilidade.
+- **Indexação desacoplada (Offline Ingestion Pipeline):** o catálogo de cada ciclo é ingerido e indexado por um *pipeline* assíncrono e desacoplado da aplicação principal (gerenciado por scripts/DAGs de ingestão), abrangendo as etapas de extração, *chunking*, geração de embeddings e versionamento por ciclo. A API do FastAPI atua estritamente como consumidora do índice já vetorizado. Isso elimina a latência no *startup* dos pods, reduz o consumo de memória do servidor web e permite que a virada de ciclo ocorra em tempo real sem necessidade de *redeploy* ou reinício de processos.
+- **Qualidade de Recuperação (Filtros por Metadados e Reranking):**
+  - **Filtros por Metadados (Metadata Filtering):** cada *chunk* recebe *tags* estruturadas (ex: `ciclo`, `marca`, `categoria`, `status_estoque`). Durante a consulta, a busca vetorial aplica um filtro estrito nos metadados antes do cálculo de similaridade, garantindo que o modelo nunca recupere produtos de ciclos encerrados ou de marcas concorrentes no mesmo universo de busca.
+  - **Reordenamento Semântico (Reranking):** implementação de uma etapa de duas fases (*Two-Stage Retrieval*). O banco vetorial realiza uma recuperação inicial abrangente (ex: *top-20* candidatas), e um modelo especializado de *Reranker* (ex: Cohere Rerank ou Cross-Encoder) reavalia a aderência exata dos trechos com a pergunta da revendedora, entregando ao LLM apenas o *top-3* de maior precisão. Isso reduz a janela de contexto, economiza tokens e elimina alucinações de preços e regras de promoções.
+
+
 
 ### FinOps e Resiliência de IA
 - **Capacidade garantida:** contratos de **throughput provisionado** com o provedor de LLM, para não depender da cota do plano gratuito (os erros 429 do MVP), com monitoramento de consumo de tokens por rota e por ciclo.
