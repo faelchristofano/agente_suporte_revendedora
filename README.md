@@ -258,7 +258,7 @@ O MVP prova o fluxo ponta a ponta em **um único processo**, com estado, índice
 
 ### Infraestrutura e Elasticidade
 - **Conteinerização (Docker):** imagem única e versionada para a API, com *health checks* (`GET /health`) e configuração 100% por variáveis de ambiente.
-- **Orquestração em Kubernetes (K8s):** a API roda como `Deployment` com várias réplicas, atrás de **Load Balancer / Ingress**.
+- **Orquestração em Kubernetes (Google GKE):** a API roda como `Deployment` com várias réplicas, atrás de **Load Balancer / Ingress**.
 - **Autoescalonamento (HPA):** o **Horizontal Pod Autoscaler** adiciona e remove pods conforme CPU e número de conexões SSE ativas, absorvendo os picos de início de ciclo. Também é possível pré-escalar por calendário nas datas conhecidas de abertura.
 - **Conexões longas (SSE):** timeouts do Ingress ajustados para streaming, com *graceful shutdown* para não derrubar respostas em andamento durante deploys.
 
