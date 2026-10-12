@@ -279,8 +279,13 @@ O MVP prova o fluxo ponta a ponta em **um único processo**, com estado, índice
 ### FinOps e Resiliência de IA
 - **Capacidade garantida:** contratos de **throughput provisionado** com o provedor de LLM, para não depender da cota do plano gratuito (os erros 429 do MVP), com monitoramento de consumo de tokens por rota e por ciclo.
 - **Roteamento e Fallbacks:** uma camada de *LLM routing* troca automaticamente para outro modelo ou provedor se a API principal sofrer timeout, erro ou limite de cota. Modelos menores atendem perguntas simples e os maiores ficam para as complexas.
-- **Cache Semântico distribuído no Redis:** substitui o `InMemoryCache` (*exact match*, local a cada pod) por um cache compartilhado entre as réplicas e baseado em **similaridade de embeddings**, de modo que perguntas equivalentes ("preço do Malbec?" e "quanto custa o Malbec?") reaproveitem a resposta. Reduz custo e latência em escala. Fica restrito a conteúdo não personalizado, e as respostas com dados do pedido de uma revendedora nunca entram no cache compartilhado.
-- **Proteção do sistema:** *rate limiting* por revendedora, *circuit breakers* e filas para absorver rajadas.
+- **Estratégias Avançadas de Cache para Escala (500k+ Revendedoras):** o MVP utiliza um `InMemoryCache` simples, volátil e baseado em *exact match*. Para suportar milhares de acessos simultâneos garantindo que o bot nunca entregue "dados velhos", a evolução prevê:
+  - **Cache Semântico Distribuído (Redis):** substitui o cache local por um cache centralizado usando **similaridade de embeddings**. Perguntas equivalentes ("preço do Malbec?" e "quanto custa o Malbec?") reaproveitam a resposta, reduzindo custo de cota e zerando a latência. Fica restrito a conteúdo não personalizado (dados do pedido de uma revendedora nunca entram no cache compartilhado).
+  - **Invalidação de Cache por Domínio (Prevenção de Alucinação):**
+    - *RAG (Catálogo):* a chave do cache recebe o versionamento do ciclo (ex: `chave_hash + "_Ciclo_16"`). Quando o ciclo vira, o cache antigo é isolado e o sistema é forçado a consultar o índice vetorial novo.
+    - *MCP (Transacional):* dados voláteis como rastreio de pedidos e estoque recebem um **TTL (Time-To-Live)** curto (ex: 5 minutos) no Redis, garantindo que atualizações de ERP reflitam quase em tempo real sem sobrecarregar os sistemas internos.
+
+- **Proteção do sistema:** Para garantir a estabilidade sob a demanda de milhares de revendedoras, a arquitetura combina **filas de mensageria** para amortecer picos de tráfego repentinos no início de cada ciclo, regras de **rate limiting** para evitar abusos individuais e proteger a cota do LLM, e **circuit breakers** para interromper requisições a integrações inoperantes, prevenindo falhas em cascata e mantendo o agente sempre responsivo.
 
 ### Mitigação de Cold Start e Resiliência
 Duas estratégias, **já implementadas no MVP**, atacam as duas causas mais comuns de erro percebido pelo usuário: a lentidão da primeira requisição (*cold start*) e as oscilações transitórias de rede.
