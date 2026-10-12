@@ -21,10 +21,11 @@ O sistema é um **agente inteligente transacional e de RAG com memória isolada 
 ```mermaid
 flowchart LR
     UI[Streamlit<br/>frontend.py] -- "POST /chat (SSE)" --> API[FastAPI<br/>main.py]
-    API -- "astream(thread_id)" --> G
+    
+    API -- "astream(thread_id)<br/>+ Retry Automático" --> G
 
     subgraph G[LangGraph - app/agent/graph.py]
-        A[agente<br/>Gemini + tools] -->|tool_calls| T[ferramentas<br/>ToolNode]
+        A[agente<br/>Gemini + Cache] -->|tool_calls| T[ferramentas<br/>ToolNode]
         T -->|resultado| A
         T -->|transferir_para_humano| H[transbordo<br/>mensagem fixa]
         A -->|resposta final| E((END))
