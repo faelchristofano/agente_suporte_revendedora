@@ -40,17 +40,17 @@ from app.tools.rag import consultar_catalogo  # noqa: E402
 # Modelo + ferramentas
 # ---------------------------------------------------------------------------
 # MODELO_LLM = "gemini-1.5-flash"
-MODELO_LLM = "gemini-3.8-flash"
+MODELO_LLM = "gemini-3.8"
 
 tools = [consultar_catalogo, buscar_status_pedido, transferir_para_humano]
 
-# max_retries=2: retry nativo do SDK do Gemini reativado (o retry da rota /chat está
+# max_retries=0: retry nativo do SDK do Gemini reativado (o retry da rota /chat está
 # desativado temporariamente em main.py; se ele for religado, voltar para max_retries=0
 # para as tentativas não se multiplicarem). O timeout evita esperas indefinidas.
 llm = ChatGoogleGenerativeAI(
     model=MODELO_LLM,
     temperature=0,
-    max_retries=2,
+    max_retries=0,
     timeout=60,
 )
 llm_com_tools = llm.bind_tools(tools)
