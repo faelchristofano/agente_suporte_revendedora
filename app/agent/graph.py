@@ -40,13 +40,13 @@ from app.tools.rag import consultar_catalogo  # noqa: E402
 # Modelo + ferramentas
 # ---------------------------------------------------------------------------
 # MODELO_LLM = "gemini-1.5-flash"
-MODELO_LLM = "gemini-3.8-flash"
+MODELO_LLM = "gemini-3.8"
 
 tools = [consultar_catalogo, buscar_status_pedido, transferir_para_humano]
 
-# max_retries=0: as retentativas ficam centralizadas na rota /chat (3 tentativas, só para
-# erros de conexão/timeout, com log). Retries também no SDK multiplicariam as chamadas
-# (3 x 3) e reenviariam 429, gastando mais cota. O timeout evita esperas indefinidas.
+# max_retries=0: retry nativo do SDK do Gemini reativado (o retry da rota /chat está
+# desativado temporariamente em main.py; se ele for religado, voltar para max_retries=0
+# para as tentativas não se multiplicarem). O timeout evita esperas indefinidas.
 llm = ChatGoogleGenerativeAI(
     model=MODELO_LLM,
     temperature=0,
@@ -103,9 +103,35 @@ com isso e sugira procurar o canal oficial de atendimento."""
 
 
 # ---------------------------------------------------------------------------
+# Estado
+# ---------------------------------------------------------------------------
+class EstadoAgente(MessagesState):
+    """Estado do grafo: histórico de mensagens + intenção pré-classificada.
+
+    `intencao_detectada` ('RAG' | 'PEDIDO' | 'HANDOFF' | 'GERAL') é preenchida pela
+    triagem determinística (app/triagem.py) ANTES da invocação do grafo."""
+
+    intencao_detectada: str
+
+
+# Dicas de roteamento injetadas no prompt conforme a intenção triada (acelera a
+# escolha da ferramenta pelo modelo). 'GERAL' e 'HANDOFF' não precisam de dica.
+DICAS_POR_INTENCAO = {
+    "RAG": (
+        "TRIAGEM PRÉ-GRAFO: intenção provável = RAG (produtos, preços, promoções). "
+        "Consulte `consultar_catalogo` antes de responder."
+    ),
+    "PEDIDO": (
+        "TRIAGEM PRÉ-GRAFO: intenção provável = PEDIDO (rastreio/status/entrega). "
+        "Use `buscar_status_pedido`; se faltar CPF ou número do pedido, peça-os primeiro."
+    ),
+}
+
+
+# ---------------------------------------------------------------------------
 # Nós do grafo
 # ---------------------------------------------------------------------------
-async def chamar_modelo(state: MessagesState) -> dict:
+async def chamar_modelo(state: EstadoAgente) -> dict:
     """Nó principal: injeta o SystemMessage e chama o Gemini com as tools.
 
     É assíncrono (`ainvoke`) para não ocupar uma thread do pool a cada token e
@@ -114,7 +140,16 @@ async def chamar_modelo(state: MessagesState) -> dict:
     """
     # O prompt é adicionado a cada chamada (e não guardado no estado), garantindo
     # que o guardrail esteja sempre na primeira posição e nunca seja duplicado.
-    resposta = await llm_com_tools.ainvoke([SYSTEM_PROMPT, *state["messages"]])
+    # A dica da triagem vai no MESMO SystemMessage (um só, no início), como sugestão:
+    # a triagem é heurística, então o modelo pode ignorá-la se estiver claramente errada.
+    prompt = SYSTEM_PROMPT
+    dica = DICAS_POR_INTENCAO.get(state.get("intencao_detectada", ""))
+    if dica:
+        prompt = SystemMessage(
+            content=f"{SYSTEM_PROMPT.content}\n\n{dica} (Se a mensagem claramente "
+            "indicar outra coisa, ignore esta dica.)"
+        )
+    resposta = await llm_com_tools.ainvoke([prompt, *state["messages"]])
     return {"messages": [resposta]}
 
 
@@ -122,7 +157,7 @@ async def chamar_modelo(state: MessagesState) -> dict:
 nodo_ferramentas = ToolNode(tools)
 
 
-def rotear_apos_ferramentas(state: MessagesState) -> str:
+def rotear_apos_ferramentas(state: EstadoAgente) -> str:
     """Depois das tools: se o transbordo foi acionado neste turno, vai para o nó
     de transbordo; caso contrário, devolve o resultado ao modelo (fluxo normal
     do RAG e de Pedidos)."""
@@ -134,19 +169,31 @@ def rotear_apos_ferramentas(state: MessagesState) -> str:
     return "agente"
 
 
-def transbordo(state: MessagesState) -> dict:
+def transbordo(state: EstadoAgente) -> dict:
     """Responde com a mensagem padrão de transferência e segue para o END."""
     return {"messages": [AIMessage(content=MENSAGEM_TRANSBORDO)]}
 
 # ---------------------------------------------------------------------------
 # Construção do grafo
 # ---------------------------------------------------------------------------
-workflow = StateGraph(MessagesState)
+def rotear_inicio(state: EstadoAgente) -> str:
+    """Nó de início (cascata de modelos): se a triagem detectou HANDOFF (pedido explícito
+    por atendente ou frustração clara), vai direto ao nó de transbordo, sem gastar uma
+    chamada ao LLM. Qualquer outra intenção segue para o agente (Gemini)."""
+    return "transbordo" if state.get("intencao_detectada") == "HANDOFF" else "agente"
+
+
+workflow = StateGraph(EstadoAgente)
 workflow.add_node("agente", chamar_modelo)
 workflow.add_node("ferramentas", nodo_ferramentas)
 workflow.add_node("transbordo", transbordo)
 
-workflow.add_edge(START, "agente")
+# Início: triagem determinística decide entre transbordo direto e o agente (LLM).
+workflow.add_conditional_edges(
+    START,
+    rotear_inicio,
+    {"transbordo": "transbordo", "agente": "agente"},
+)
 # Aresta condicional: se a última mensagem tiver tool_calls -> "ferramentas"; senão -> END.
 workflow.add_conditional_edges(
     "agente",

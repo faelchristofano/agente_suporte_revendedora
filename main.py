@@ -30,6 +30,7 @@ from app.resilience import (  # noqa: E402
     entrada_para_retry,
 )
 from app.tools.rag import aquecer_indice  # noqa: E402
+from app.triagem import triar_entrada  # noqa: E402
 
 
 logger = logging.getLogger("uvicorn.error")
@@ -55,6 +56,11 @@ LANGFUSE_ATIVO = bool(
 if not LANGFUSE_ATIVO:
     print("[startup] Langfuse desativado: defina LANGFUSE_PUBLIC_KEY e LANGFUSE_SECRET_KEY.")
 
+
+# Chaves para ligar/desligar as estratégias de estabilidade (útil para testes/diagnóstico).
+# DESATIVADOS TEMPORARIAMENTE: para reativar, basta trocar para True.
+WARMUP_ATIVO = True  # warm-up no startup (ChromaDB + ping no LangGraph/Gemini)
+RETRY_ATIVO = True  # retry automático na rota /chat (3 tentativas)
 
 WARMUP_TIMEOUT_S = 60
 WARMUP_THREAD_ID = "__warmup__"  # thread isolada: o ping não aparece nas conversas reais
@@ -92,10 +98,13 @@ async def _warmup() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
-    logger.info("Iniciando warm-up...")
-    t0 = time.perf_counter()
-    await _warmup()  # o servidor só começa a aceitar requisições depois daqui
-    logger.info("Servidor pronto (warm-up em %.1fs)", time.perf_counter() - t0)
+    if WARMUP_ATIVO:
+        logger.info("Iniciando warm-up...")
+        t0 = time.perf_counter()
+        await _warmup()  # o servidor só começa a aceitar requisições depois daqui
+        logger.info("Servidor pronto (warm-up em %.1fs)", time.perf_counter() - t0)
+    else:
+        logger.info("Warm-up desativado (WARMUP_ATIVO=False). Servidor pronto.")
     yield
     logger.info("Encerrando servidor...")
     if LANGFUSE_ATIVO:
@@ -161,11 +170,25 @@ async def chat(request: ChatRequest):
             # imediatamente, enquanto o modelo ainda decide se usa tools.
             yield ": conectado\n\n"
 
-            entrada = {"messages": [("user", request.mensagem)]}
+            # Cascata de modelos, etapa 1: triagem determinística (microssegundos, sem LLM).
+            triagem = await triar_entrada(request.mensagem, request.thread_id)
+            if triagem.bloqueado:
+                # Guardrail de entrada: aborta ANTES do LangGraph/Gemini (zero custo de LLM)
+                # e responde com uma mensagem segura. A mensagem bloqueada não entra no
+                # histórico da conversa.
+                yield _formatar_sse(triagem.resposta)
+                return
+
+            # Etapa 2: a intenção classificada entra no estado inicial do grafo.
+            entrada = {
+                "messages": [("user", request.mensagem)],
+                "intencao_detectada": triagem.intencao,
+            }
             enviou_texto = False
 
             # Retry Pattern: 1 chamada original + até 2 retries, com backoff exponencial curto.
-            for tentativa in range(1, MAX_TENTATIVAS + 1):
+            tentativas_max = MAX_TENTATIVAS if RETRY_ATIVO else 1
+            for tentativa in range(1, tentativas_max + 1):
                 try:
                     async for chunk, metadata in graph_app.astream(
                         entrada, config=config, stream_mode="messages"
@@ -187,14 +210,14 @@ async def chat(request: ChatRequest):
                     if (
                         enviou_texto
                         or not eh_transitorio(e)
-                        or tentativa == MAX_TENTATIVAS
+                        or tentativa == tentativas_max
                     ):
                         raise
                     espera = BACKOFF_INICIAL_S * 2 ** (tentativa - 1)
                     logger.warning(
                         "Erro transitório no /chat (thread_id=%s, tentativa %d/%d): %s: %s. "
                         "Nova tentativa em %.1fs",
-                        request.thread_id, tentativa, MAX_TENTATIVAS,
+                        request.thread_id, tentativa, tentativas_max,
                         type(e).__name__, e, espera,
                     )
                     await asyncio.sleep(espera)
