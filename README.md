@@ -49,6 +49,7 @@ flowchart LR
 ├── .env.example             # Modelo das variáveis de ambiente
 └── app/
     ├── resilience.py        # Política de retry: erros transitórios e retomada do grafo
+    ├── triagem.py           # Guardrail de entrada + classificação de intenção (pré-grafo)
     ├── agent/
     │   └── graph.py         # Grafo LangGraph, system prompt, cache e checkpointer
     └── tools/
@@ -117,6 +118,9 @@ Selecionado como motor de raciocínio pelas capacidades de **Function Calling** 
 - **Infraestrutura:** `GET /health` é um endpoint leve (sem chamar LLM, banco vetorial ou serviços externos) para **probes de liveness/readiness do Kubernetes** e verificações de balanceadores de carga.
 - **Human Handoff (Transbordo):** a tool `transferir_para_humano` é acionada quando a revendedora pede explicitamente um atendente ou demonstra extrema frustração. O grafo então segue para um nó dedicado que devolve a mensagem padrão de transferência e vai direto ao `END`, sem nova chamada ao LLM e sem afetar o roteamento do RAG e de Pedidos.
 - **Cache de LLM (`InMemoryCache`):** `set_llm_cache(InMemoryCache())` evita requisições duplicadas ao Google. Para uma requisição idêntica (mesmo histórico, prompt e parâmetros), a resposta vem do cache, **sem custo de cota e com latência praticamente nula**. Isso mitiga os limites de cota (erro 429). A chave é o prompt completo (*exact match*, não há comparação por similaridade semântica) e o cache vive apenas enquanto o processo estiver de pé.
+- **Cascata de Modelos (triagem pré-grafo):** antes de invocar o LangGraph/Gemini, uma camada determinística de baixíssima latência (`app/triagem.py`, regras sem chamada de rede) faz duas coisas: (1) **guardrail de entrada**, que barra pedidos explícitos de margem de outras revendedoras, senhas/credenciais, PII de terceiros e tentativas de *jailbreak*, respondendo com uma mensagem segura **sem gastar tempo nem cota de LLM** (a mensagem bloqueada não entra no histórico); (2) **classificação de intenção** (`RAG`, `PEDIDO`, `HANDOFF` ou `GERAL`), gravada em `state["intencao_detectada"]`. Para `RAG` e `PEDIDO`, a intenção vira uma dica de roteamento no prompt, acelerando a escolha da ferramenta. Para `HANDOFF`, o nó inicial do grafo vai **direto ao transbordo, sem chamar o LLM**. Os eventos são logados (`[TRIAGEM] Intenção detectada: ... | Guardrail: PASSED` e `[GUARDRAIL] Bloqueio acionado ...`). É uma primeira barreira heurística: pega tentativas explícitas, e os casos sutis seguem cobertos pelo prompt de sistema e pelas camadas descritas na seção 6.
+
+  > **Evolução para Produção:** em um cenário Enterprise, essa camada de regras estáticas evolui para um modelo discriminativo leve (como o Jev Model / System One), mantendo o processamento em milissegundos e o custo menor que o LLM gerador, mas ganhando inteligência semântica para barrar variações, erros de digitação e jailbreaks avançados que passam por regex.
 - **Streaming de baixa latência:** o nó do agente usa `ainvoke` (assíncrono) e o `/chat` emite o primeiro byte imediatamente (`: conectado`). O índice vetorial é pré-aquecido no startup, para que a primeira pergunta não pague o custo dos embeddings.
 
 ---
@@ -291,6 +295,7 @@ O MVP prova o fluxo ponta a ponta em **um único processo**, com estado, índice
     - *MCP (Transacional):* dados voláteis como rastreio de pedidos e estoque recebem um **TTL (Time-To-Live)** curto (ex: 5 minutos) no Redis, garantindo que atualizações de ERP reflitam quase em tempo real sem sobrecarregar os sistemas internos.
 
 - **Proteção do sistema:** Para garantir a estabilidade sob a demanda de milhares de revendedoras, a arquitetura combina **filas de mensageria** para amortecer picos de tráfego repentinos no início de cada ciclo, regras de **rate limiting** para evitar abusos individuais e proteger a cota do LLM, e **circuit breakers** para interromper requisições a integrações inoperantes, prevenindo falhas em cascata e mantendo o agente sempre responsivo.
+- **Triagem e Guardrail por Modelo Discriminativo (Jev Model / System One):** substituição das regras estáticas do middleware por um modelo discriminativo de ultra baixa latência. O modelo atua como primeira barreira antes do LangGraph, realizando classificação tipada de intenção (Choice) e bloqueio de jailbreaks semânticos (Noul), evitando chamadas desnecessárias ao Gemini e reduzindo drasticamente os custos operacionais.
 
 ### Mitigação de Cold Start e Resiliência
 Duas estratégias, **já implementadas no MVP**, atacam as duas causas mais comuns de erro percebido pelo usuário: a lentidão da primeira requisição (*cold start*) e as oscilações transitórias de rede.
